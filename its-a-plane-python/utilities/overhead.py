@@ -116,8 +116,12 @@ TRACKED_FILE = os.path.join(DATA_DIR, "tracked_flight.json")
 MAPS_DIR = os.path.join(DATA_DIR, "maps")
 os.makedirs(MAPS_DIR, exist_ok=True)
 ROUTE_AUDIT_LOG = os.path.join(DATA_DIR, "route_audit.log")
+COMPARISON_LOG = os.path.join(DATA_DIR, "source_comparison.log")
 
 HOSTNAME = socket.gethostname()
+
+# Lock for comparison log writes from multiple threads
+_comparison_log_lock = Lock()
 
 # In-memory caches for adsbdb lookups (GA aircraft owner info)
 _aircraft_cache = {}  # registration -> {data, ts}
@@ -439,6 +443,54 @@ def log_farthest_flight(entry: dict):
         import traceback
         print("Failed to log farthest flight:", e)
         traceback.print_exc()
+
+
+# =============================================================================
+# Source Comparison (FR24 vs adsb.lol/adsbdb — background logging only)
+# =============================================================================
+
+def _compare_sources(callsign, fr24_origin, fr24_dest, plane_lat, plane_lon, dist):
+    """Background comparison: query adsbdb for the same callsign and log differences.
+    This does NOT affect the display — purely for analysis."""
+    try:
+        url = f"{ADSBDB_BASE}/v0/callsign/{callsign}"
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            adsbdb_origin = ""
+            adsbdb_dest = ""
+            adsbdb_airline = ""
+        else:
+            data = r.json().get("response", {}).get("flightroute", {}) or {}
+            origin_info = data.get("origin", {}) or {}
+            dest_info = data.get("destination", {}) or {}
+            adsbdb_origin = origin_info.get("iata_code", "")
+            adsbdb_dest = dest_info.get("iata_code", "")
+            airline_info = data.get("airline", {}) or {}
+            adsbdb_airline = airline_info.get("name", "")
+
+        fr24_route = f"{fr24_origin or '?'}->{fr24_dest or '?'}"
+        adsbdb_route = f"{adsbdb_origin or '?'}->{adsbdb_dest or '?'}"
+
+        if fr24_route == adsbdb_route:
+            status = "MATCH"
+        elif not adsbdb_origin and not adsbdb_dest:
+            status = "ADSBDB_EMPTY"
+        elif not fr24_origin and not fr24_dest:
+            status = "FR24_EMPTY"
+        else:
+            status = "MISMATCH"
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = (f"{ts} [{HOSTNAME}] {callsign:12s} {dist:5.1f}mi  "
+                f"fr24={fr24_route:15s} adsbdb={adsbdb_route:15s} "
+                f"adsbdb_airline={adsbdb_airline:20s} {status}\n")
+
+        with _comparison_log_lock:
+            with open(COMPARISON_LOG, "a", encoding="utf-8") as f:
+                f.write(line)
+
+    except Exception:
+        pass  # never affect the main loop
 
 
 # Overhead Class
@@ -763,6 +815,12 @@ class Overhead:
 
                         log_flight_data(entry)
                         log_farthest_flight(entry)
+
+                        # Background comparison: FR24 vs adsbdb (non-blocking)
+                        Thread(target=_compare_sources,
+                               args=(callsign, origin, destination,
+                                     f.latitude, f.longitude, entry["distance"]),
+                               daemon=True).start()
                         break
 
                     except Exception as e:
